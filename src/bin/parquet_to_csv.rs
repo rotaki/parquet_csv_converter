@@ -12,7 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  --method <M>      Conversion method: chunk (default) or row");
         eprintln!("\nExamples:");
         eprintln!("  {} input.parquet output.csv", args[0]);
-        eprintln!("  {} input.parquet output.csv --threads 8 --stats", args[0]);
+        eprintln!("  {} input.parquet output.csv --threads 8", args[0]);
         eprintln!("  {} input.parquet output.csv --method row", args[0]);
         std::process::exit(1);
     }
@@ -23,7 +23,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse optional arguments
     let mut num_threads = num_cpus::get();
     let mut method = "chunk";
-    let mut enable_stats = false;
 
     let mut i = 3;
     while i < args.len() {
@@ -46,9 +45,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     i += 1;
                 }
-            }
-            "--stats" => {
-                enable_stats = true;
             }
             _ => {
                 eprintln!("Unknown option: {}", args[i]);
@@ -83,12 +79,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match result {
         Ok(()) => {
             let elapsed = start_time.elapsed();
-            let throughput_mb = (converter.len() as f64 * 50.0) / (1024.0 * 1024.0); // Rough estimate
-            let throughput_mbps = throughput_mb / elapsed.as_secs_f64();
 
-            println!("\nConversion complete!");
-            println!("Time: {:.2}s", elapsed.as_secs_f64());
-            println!("Throughput: ~{:.2} MB/s", throughput_mbps);
+            // Get actual output file size
+            match std::fs::metadata(output_path) {
+                Ok(metadata) => {
+                    let output_size = metadata.len();
+                    let output_mb = output_size as f64 / 1_048_576.0;
+                    let throughput_mbps = output_mb / elapsed.as_secs_f64();
+                    let rows_per_sec = converter.len() as f64 / elapsed.as_secs_f64();
+                    let iops = (output_size as f64 / 4096.0) / elapsed.as_secs_f64();
+
+                    println!("\nConversion complete!");
+                    println!("Time: {:.2}s", elapsed.as_secs_f64());
+                    println!("Output size: {:.2} MB ({} bytes)", output_mb, output_size);
+                    println!("Throughput: {:.2} MB/s", throughput_mbps);
+                    println!("Rows/second: {:.0}", rows_per_sec);
+                    println!("IOPS: {:.0} (assuming 4KB blocks)", iops);
+                }
+                Err(_) => {
+                    println!("\nConversion complete!");
+                    println!("Time: {:.2}s", elapsed.as_secs_f64());
+                    println!("(Could not determine output file size)");
+                }
+            }
         }
         Err(e) => {
             eprintln!("Error: {}", e);
