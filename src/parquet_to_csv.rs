@@ -1,10 +1,8 @@
 //! Parquet to CSV converter with parallel processing support
 
 use crate::{
-    aligned_reader::AlignedChunkReader,
-    constants::open_file_with_direct_io,
-    parallel_csv_writer::ParallelCsvWriterBuilder,
-    IoStatsTracker,
+    aligned_reader::AlignedChunkReader, chunked_csv_converter::record_batch_to_csv_lines,
+    file_manager::open_file_with_direct_io,
 };
 use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::{DataType, TimeUnit};
@@ -23,115 +21,179 @@ fn value_to_csv_string(array: &ArrayRef, row: usize) -> String {
 
     match array.data_type() {
         DataType::Boolean => {
-            let arr = array.as_any().downcast_ref::<arrow::array::BooleanArray>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .unwrap();
             arr.value(row).to_string()
         }
         DataType::Int8 => {
-            let arr = array.as_any().downcast_ref::<arrow::array::Int8Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int8Array>()
+                .unwrap();
             arr.value(row).to_string()
         }
         DataType::Int16 => {
-            let arr = array.as_any().downcast_ref::<arrow::array::Int16Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int16Array>()
+                .unwrap();
             arr.value(row).to_string()
         }
         DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<arrow::array::Int32Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap();
             arr.value(row).to_string()
         }
         DataType::Int64 => {
-            let arr = array.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
             arr.value(row).to_string()
         }
         DataType::UInt8 => {
-            let arr = array.as_any().downcast_ref::<arrow::array::UInt8Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::UInt8Array>()
+                .unwrap();
             arr.value(row).to_string()
         }
         DataType::UInt16 => {
-            let arr = array.as_any().downcast_ref::<arrow::array::UInt16Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::UInt16Array>()
+                .unwrap();
             arr.value(row).to_string()
         }
         DataType::UInt32 => {
-            let arr = array.as_any().downcast_ref::<arrow::array::UInt32Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::UInt32Array>()
+                .unwrap();
             arr.value(row).to_string()
         }
         DataType::UInt64 => {
-            let arr = array.as_any().downcast_ref::<arrow::array::UInt64Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .unwrap();
             arr.value(row).to_string()
         }
         DataType::Float32 => {
-            let arr = array.as_any().downcast_ref::<arrow::array::Float32Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Float32Array>()
+                .unwrap();
             arr.value(row).to_string()
         }
         DataType::Float64 => {
-            let arr = array.as_any().downcast_ref::<arrow::array::Float64Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap();
             arr.value(row).to_string()
         }
         DataType::Utf8 => {
-            let arr = array.as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
             escape_csv_value(arr.value(row))
         }
         DataType::LargeUtf8 => {
-            let arr = array.as_any().downcast_ref::<arrow::array::LargeStringArray>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::LargeStringArray>()
+                .unwrap();
             escape_csv_value(arr.value(row))
         }
         DataType::Binary => {
-            let arr = array.as_any().downcast_ref::<arrow::array::BinaryArray>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::BinaryArray>()
+                .unwrap();
             hex::encode(arr.value(row))
         }
         DataType::LargeBinary => {
-            let arr = array.as_any().downcast_ref::<arrow::array::LargeBinaryArray>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::LargeBinaryArray>()
+                .unwrap();
             hex::encode(arr.value(row))
         }
         DataType::Date32 => {
-            let arr = array.as_any().downcast_ref::<arrow::array::Date32Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Date32Array>()
+                .unwrap();
             let days = arr.value(row);
             let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163)
                 .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
             date.format("%Y-%m-%d").to_string()
         }
         DataType::Date64 => {
-            let arr = array.as_any().downcast_ref::<arrow::array::Date64Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Date64Array>()
+                .unwrap();
             let millis = arr.value(row);
             let datetime = chrono::DateTime::from_timestamp_millis(millis)
                 .unwrap_or_else(|| chrono::DateTime::from_timestamp_millis(0).unwrap());
             datetime.format("%Y-%m-%d").to_string()
         }
-        DataType::Timestamp(unit, _tz) => {
-            match unit {
-                TimeUnit::Second => {
-                    let arr = array.as_any().downcast_ref::<arrow::array::TimestampSecondArray>().unwrap();
-                    let ts = arr.value(row);
-                    let datetime = chrono::DateTime::from_timestamp(ts, 0)
-                        .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
-                    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
-                }
-                TimeUnit::Millisecond => {
-                    let arr = array.as_any().downcast_ref::<arrow::array::TimestampMillisecondArray>().unwrap();
-                    let ts = arr.value(row);
-                    let datetime = chrono::DateTime::from_timestamp_millis(ts)
-                        .unwrap_or_else(|| chrono::DateTime::from_timestamp_millis(0).unwrap());
-                    datetime.format("%Y-%m-%d %H:%M:%S.%3f").to_string()
-                }
-                TimeUnit::Microsecond => {
-                    let arr = array.as_any().downcast_ref::<arrow::array::TimestampMicrosecondArray>().unwrap();
-                    let ts = arr.value(row);
-                    let datetime = chrono::DateTime::from_timestamp_micros(ts)
-                        .unwrap_or_else(|| chrono::DateTime::from_timestamp_micros(0).unwrap());
-                    datetime.format("%Y-%m-%d %H:%M:%S.%6f").to_string()
-                }
-                TimeUnit::Nanosecond => {
-                    let arr = array.as_any().downcast_ref::<arrow::array::TimestampNanosecondArray>().unwrap();
-                    let ts = arr.value(row);
-                    let secs = ts / 1_000_000_000;
-                    let nanos = (ts % 1_000_000_000) as u32;
-                    let datetime = chrono::DateTime::from_timestamp(secs, nanos)
-                        .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
-                    datetime.format("%Y-%m-%d %H:%M:%S.%9f").to_string()
-                }
+        DataType::Timestamp(unit, _tz) => match unit {
+            TimeUnit::Second => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<arrow::array::TimestampSecondArray>()
+                    .unwrap();
+                let ts = arr.value(row);
+                let datetime = chrono::DateTime::from_timestamp(ts, 0)
+                    .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
+                datetime.format("%Y-%m-%d %H:%M:%S").to_string()
             }
-        }
+            TimeUnit::Millisecond => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<arrow::array::TimestampMillisecondArray>()
+                    .unwrap();
+                let ts = arr.value(row);
+                let datetime = chrono::DateTime::from_timestamp_millis(ts)
+                    .unwrap_or_else(|| chrono::DateTime::from_timestamp_millis(0).unwrap());
+                datetime.format("%Y-%m-%d %H:%M:%S.%3f").to_string()
+            }
+            TimeUnit::Microsecond => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+                    .unwrap();
+                let ts = arr.value(row);
+                let datetime = chrono::DateTime::from_timestamp_micros(ts)
+                    .unwrap_or_else(|| chrono::DateTime::from_timestamp_micros(0).unwrap());
+                datetime.format("%Y-%m-%d %H:%M:%S.%6f").to_string()
+            }
+            TimeUnit::Nanosecond => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+                    .unwrap();
+                let ts = arr.value(row);
+                let secs = ts / 1_000_000_000;
+                let nanos = (ts % 1_000_000_000) as u32;
+                let datetime = chrono::DateTime::from_timestamp(secs, nanos)
+                    .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
+                datetime.format("%Y-%m-%d %H:%M:%S.%9f").to_string()
+            }
+        },
         DataType::Decimal128(_, scale) => {
-            let arr = array.as_any().downcast_ref::<arrow::array::Decimal128Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Decimal128Array>()
+                .unwrap();
             let value = arr.value(row);
             format_decimal128(value, *scale as i32)
         }
@@ -147,11 +209,11 @@ fn format_decimal128(value: i128, scale: i32) -> String {
     if scale == 0 {
         return value.to_string();
     }
-    
+
     let divisor = 10i128.pow(scale as u32);
     let int_part = value / divisor;
     let frac_part = (value % divisor).abs();
-    
+
     if frac_part == 0 {
         int_part.to_string()
     } else {
@@ -173,12 +235,12 @@ fn escape_csv_value(value: &str) -> String {
 /// Convert a RecordBatch row to a CSV line
 fn record_batch_row_to_csv(batch: &RecordBatch, row: usize) -> String {
     let mut csv_values = Vec::new();
-    
+
     for col_idx in 0..batch.num_columns() {
         let array = batch.column(col_idx);
         csv_values.push(value_to_csv_string(array, row));
     }
-    
+
     csv_values.join(",")
 }
 
@@ -250,10 +312,9 @@ impl ParquetToCsvConverter {
     }
 
     /// Create parallel scanners that output CSV lines
-    pub fn create_parallel_csv_scanners(
+    pub fn create_parallel_scanners(
         &self,
         num_scanners: usize,
-        io_tracker: Option<IoStatsTracker>,
     ) -> Vec<Box<dyn Iterator<Item = String> + Send>> {
         if num_scanners == 0 || self.is_empty() {
             return vec![];
@@ -270,14 +331,13 @@ impl ParquetToCsvConverter {
                 break;
             }
 
-            let scanner = CsvPartitionScanner {
+            let scanner = PartitionScanner {
                 fd: self.fd,
                 start_row_group: start_group,
                 end_row_group: end_group,
                 current_batch: None,
                 current_row: 0,
                 reader: None,
-                io_stats: io_tracker.clone(),
             };
 
             scanners.push(Box::new(scanner) as Box<dyn Iterator<Item = String> + Send>);
@@ -285,119 +345,81 @@ impl ParquetToCsvConverter {
 
         scanners
     }
-    
-    /// Convert Parquet to CSV using parallel writers for maximum throughput
-    pub fn convert_to_csv_parallel(
+
+    /// Create parallel chunk scanners that output batches of CSV lines
+    pub fn create_parallel_chunk_scanners(
         &self,
-        output_path: impl AsRef<Path>,
-        num_threads: usize,
-        buffer_size: usize,
-        io_tracker: Option<IoStatsTracker>,
-    ) -> Result<(), String> {
-        let output_path = output_path.as_ref();
-        
-        // Open output file with Direct I/O
-        let output_file = open_file_with_direct_io(output_path)
-            .map_err(|e| format!("Failed to open output file: {}", e))?;
-        let output_fd = output_file.into_raw_fd();
-        
-        // Write header first
-        let header = format!("{}\n", self.get_header());
-        use crate::file_manager::pwrite_fd;
-        pwrite_fd(output_fd, header.as_bytes(), 0)
-            .map_err(|e| format!("Failed to write header: {}", e))?;
-        
-        // Create parallel writer starting after header
-        let writer = ParallelCsvWriterBuilder::new()
-            .buffer_size(buffer_size)
-            .enable_io_stats(io_tracker.is_some())
-            .build(output_fd, header.len() as u64);
-        
-        // Create scanners for each thread
-        let scanners = self.create_parallel_csv_scanners(num_threads, io_tracker);
-        
-        if scanners.is_empty() {
-            return Ok(());
+        num_scanners: usize,
+    ) -> Vec<Box<dyn Iterator<Item = Vec<String>> + Send>> {
+        if num_scanners == 0 || self.is_empty() {
+            return vec![];
         }
-        
-        // Spawn threads to process partitions in parallel
-        let handles: Vec<_> = scanners
-            .into_iter()
-            .enumerate()
-            .map(|(_thread_id, scanner)| {
-                let thread_writer = writer.get_thread_writer();
-                
-                thread::spawn(move || -> Result<(), String> {
-                    // Process scanner output with buffering
-                    thread_writer.write_lines_buffered(scanner, buffer_size)?;
-                    
-                    Ok(())
-                })
-            })
-            .collect();
-        
-        // Wait for all threads to complete
-        for (i, handle) in handles.into_iter().enumerate() {
-            match handle.join() {
-                Ok(result) => result?,
-                Err(e) => return Err(format!("Thread {} panicked: {:?}", i, e)),
+
+        let mut scanners = Vec::new();
+        let groups_per_scanner = self.num_row_groups.div_ceil(num_scanners);
+
+        for i in 0..num_scanners {
+            let start_group = i * groups_per_scanner;
+            let end_group = ((i + 1) * groups_per_scanner).min(self.num_row_groups);
+
+            if start_group >= self.num_row_groups {
+                break;
             }
+
+            let scanner = ChunkScanner {
+                fd: self.fd,
+                start_row_group: start_group,
+                end_row_group: end_group,
+                reader: None,
+            };
+
+            scanners.push(Box::new(scanner) as Box<dyn Iterator<Item = Vec<String>> + Send>);
         }
-        
-        // Close the file descriptor
-        unsafe {
-            libc::close(output_fd);
-        }
-        
-        Ok(())
+
+        scanners
     }
-    
+
     /// Convert Parquet to CSV using memory-mapped file for maximum performance
     /// This approach avoids Direct I/O alignment issues while maintaining high throughput
     pub fn convert_to_csv_mmap(
         &self,
         output_path: impl AsRef<Path>,
         num_threads: usize,
-        io_tracker: Option<IoStatsTracker>,
     ) -> Result<(), String> {
-        use crate::mmap_csv_writer::{MmapCsvWriter, estimate_csv_size};
-        
+        use crate::mmap_csv_writer::{estimate_csv_size, MmapCsvWriter};
+
         let output_path = output_path.as_ref();
-        
+
         // Estimate file size based on schema and row count
         let avg_field_size = match self.schema.fields().len() {
-            0..=5 => 20,    // Small schemas: assume larger fields
-            6..=15 => 15,   // Medium schemas
-            _ => 10,        // Large schemas: assume smaller fields
+            0..=5 => 20,  // Small schemas: assume larger fields
+            6..=15 => 15, // Medium schemas
+            _ => 10,      // Large schemas: assume smaller fields
         };
-        
-        let estimated_size = estimate_csv_size(
-            self.num_rows,
-            self.schema.fields().len(),
-            avg_field_size,
-        );
-        
+
+        let estimated_size =
+            estimate_csv_size(self.num_rows, self.schema.fields().len(), avg_field_size);
+
         // Create memory-mapped writer
-        let writer = MmapCsvWriter::new(output_path, estimated_size, io_tracker.clone())?;
-        
+        let writer = MmapCsvWriter::new(output_path, estimated_size)?;
+
         // Write header
         writer.write_header(&self.get_header())?;
-        
+
         // Create scanners for each thread
-        let scanners = self.create_parallel_csv_scanners(num_threads, io_tracker);
-        
+        let scanners = self.create_parallel_scanners(num_threads);
+
         if scanners.is_empty() {
             writer.finalize()?;
             return Ok(());
         }
-        
+
         // Spawn threads to process partitions
         let handles: Vec<_> = scanners
             .into_iter()
-            .enumerate()
-            .map(|(_thread_id, scanner)| {
+            .map(|scanner| {
                 let thread_writer = writer.get_thread_writer();
-                
+
                 thread::spawn(move || -> Result<(), String> {
                     // Process with batching for efficiency
                     thread_writer.write_lines_buffered(scanner, 1024 * 1024)?; // 1MB batches
@@ -405,7 +427,7 @@ impl ParquetToCsvConverter {
                 })
             })
             .collect();
-        
+
         // Wait for all threads
         for (i, handle) in handles.into_iter().enumerate() {
             match handle.join() {
@@ -413,28 +435,93 @@ impl ParquetToCsvConverter {
                 Err(e) => return Err(format!("Thread {} panicked: {:?}", i, e)),
             }
         }
-        
+
         // Finalize the file (truncate to actual size)
         writer.finalize()?;
-        
+
+        Ok(())
+    }
+
+    /// Convert Parquet to CSV using memory-mapped file with chunked processing
+    /// This is the most efficient method as it processes entire batches at once
+    pub fn convert_to_csv_mmap_chunked(
+        &self,
+        output_path: impl AsRef<Path>,
+        num_threads: usize,
+    ) -> Result<(), String> {
+        use crate::mmap_csv_writer::{estimate_csv_size, MmapCsvWriter};
+
+        let output_path = output_path.as_ref();
+
+        // Estimate file size based on schema and row count
+        let avg_field_size = match self.schema.fields().len() {
+            0..=5 => 20,  // Small schemas: assume larger fields
+            6..=15 => 15, // Medium schemas
+            _ => 10,      // Large schemas: assume smaller fields
+        };
+
+        let estimated_size =
+            estimate_csv_size(self.num_rows, self.schema.fields().len(), avg_field_size);
+
+        // Create memory-mapped writer
+        let writer = MmapCsvWriter::new(output_path, estimated_size)?;
+
+        // Write header
+        writer.write_header(&self.get_header())?;
+
+        // Create chunk scanners for each thread
+        let scanners = self.create_parallel_chunk_scanners(num_threads);
+
+        if scanners.is_empty() {
+            writer.finalize()?;
+            return Ok(());
+        }
+
+        // Spawn threads to process partitions
+        let handles: Vec<_> = scanners
+            .into_iter()
+            .map(|mut scanner| {
+                let thread_writer = writer.get_thread_writer();
+
+                thread::spawn(move || -> Result<(), String> {
+                    // Process chunks directly
+                    for chunk in scanner.by_ref() {
+                        // Write entire chunk at once
+                        thread_writer.write_lines(&chunk)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+
+        // Wait for all threads
+        for (i, handle) in handles.into_iter().enumerate() {
+            match handle.join() {
+                Ok(result) => result?,
+                Err(e) => return Err(format!("Thread {} panicked: {:?}", i, e)),
+            }
+        }
+
+        // Finalize the file (truncate to actual size)
+        writer.finalize()?;
+
         Ok(())
     }
 }
 
 /// Iterator over a partition of row groups that outputs CSV lines
-struct CsvPartitionScanner {
+struct PartitionScanner {
     fd: RawFd,
     start_row_group: usize,
     end_row_group: usize,
     current_batch: Option<RecordBatch>,
     current_row: usize,
     reader: Option<Box<dyn arrow::record_batch::RecordBatchReader + Send>>,
-    io_stats: Option<IoStatsTracker>,
 }
 
-impl CsvPartitionScanner {
+impl PartitionScanner {
     fn init_reader(&mut self) -> Option<()> {
-        let chunk_reader = AlignedChunkReader::new_with_tracker(self.fd, self.io_stats.clone()).ok()?;
+        let chunk_reader = AlignedChunkReader::new(self.fd).ok()?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(chunk_reader).ok()?;
         let row_groups: Vec<usize> = (self.start_row_group..self.end_row_group).collect();
         let reader = builder.with_row_groups(row_groups).build().ok()?;
@@ -443,7 +530,7 @@ impl CsvPartitionScanner {
     }
 }
 
-impl Iterator for CsvPartitionScanner {
+impl Iterator for PartitionScanner {
     type Item = String;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -467,6 +554,44 @@ impl Iterator for CsvPartitionScanner {
                 }
                 _ => return None,
             }
+        }
+    }
+}
+
+/// Iterator over a partition that outputs chunks of CSV lines
+struct ChunkScanner {
+    fd: RawFd,
+    start_row_group: usize,
+    end_row_group: usize,
+    reader: Option<Box<dyn arrow::record_batch::RecordBatchReader + Send>>,
+}
+
+impl ChunkScanner {
+    fn init_reader(&mut self) -> Option<()> {
+        let chunk_reader = AlignedChunkReader::new(self.fd).ok()?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(chunk_reader).ok()?;
+        let row_groups: Vec<usize> = (self.start_row_group..self.end_row_group).collect();
+        let reader = builder.with_row_groups(row_groups).build().ok()?;
+        self.reader = Some(Box::new(reader));
+        Some(())
+    }
+}
+
+impl Iterator for ChunkScanner {
+    type Item = Vec<String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.reader.is_none() {
+            self.init_reader()?;
+        }
+
+        match self.reader.as_mut()?.next() {
+            Some(Ok(batch)) => {
+                // Convert entire batch to CSV lines at once
+                let csv_lines = record_batch_to_csv_lines(&batch);
+                Some(csv_lines)
+            }
+            _ => None,
         }
     }
 }
@@ -520,7 +645,7 @@ mod tests {
         assert_eq!(converter.len(), 5);
         assert_eq!(converter.get_header(), "id,name");
 
-        let scanners = converter.create_parallel_csv_scanners(1, None);
+        let scanners = converter.create_parallel_scanners(1);
         let csv_lines: Vec<_> = scanners.into_iter().flatten().collect();
 
         assert_eq!(csv_lines.len(), 5);
@@ -562,7 +687,7 @@ mod tests {
 
         // Convert to CSV
         let converter = ParquetToCsvConverter::new(&path).unwrap();
-        let scanners = converter.create_parallel_csv_scanners(1, None);
+        let scanners = converter.create_parallel_scanners(1);
         let csv_lines: Vec<_> = scanners.into_iter().flatten().collect();
 
         assert_eq!(csv_lines[0], "1,\"Hello, World\"");

@@ -5,13 +5,108 @@ use bytes::Bytes;
 use parquet::errors::Result as ParquetResult;
 use parquet::file::reader::{ChunkReader, Length};
 
-use crate::aligned_buffer::AlignedBuffer;
-use crate::constants::{
+use crate::file_manager::pread_fd;
+use crate::file_manager::{
     align_down, align_up, offset_within_block, DEFAULT_BUFFER_SIZE, DIRECT_IO_ALIGNMENT,
 };
 use crate::file_size_fd;
-use crate::file_manager::pread_fd;
-use crate::io_stats::IoStatsTracker;
+
+use std::alloc::{alloc, dealloc, Layout};
+use std::slice;
+
+/// A buffer that is aligned to a specific boundary for Direct I/O operations
+pub struct AlignedBuffer {
+    ptr: *mut u8,
+    capacity: usize,
+    alignment: usize,
+    layout: Layout,
+}
+
+impl AlignedBuffer {
+    /// Create a new aligned buffer with the specified size and alignment
+    pub fn new(size: usize, alignment: usize) -> io::Result<Self> {
+        // Ensure alignment is a power of 2
+        if !alignment.is_power_of_two() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Alignment must be a power of 2",
+            ));
+        }
+
+        // Create layout with proper alignment
+        let layout = Layout::from_size_align(size, alignment)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+        // Allocate aligned memory
+        let ptr = unsafe { alloc(layout) };
+        if ptr.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "Failed to allocate aligned memory",
+            ));
+        }
+
+        // Initialize with zeros for safety and predictability
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, size);
+        }
+
+        Ok(Self {
+            ptr,
+            capacity: size,
+            alignment,
+            layout,
+        })
+    }
+
+    /// Get the buffer as a slice
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self.ptr, self.capacity) }
+    }
+
+    /// Get the buffer as a mutable slice
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { slice::from_raw_parts_mut(self.ptr, self.capacity) }
+    }
+
+    /// Get the raw pointer to the buffer
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    /// Get the mutable raw pointer to the buffer
+    #[allow(dead_code)]
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr
+    }
+
+    /// Get the capacity of the buffer
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Get the alignment of the buffer
+    pub fn alignment(&self) -> usize {
+        self.alignment
+    }
+
+    /// Check if the buffer is properly aligned
+    pub fn is_aligned(&self) -> bool {
+        self.ptr as usize % self.alignment == 0
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            dealloc(self.ptr, self.layout);
+        }
+    }
+}
+
+// Safety: AlignedBuffer owns its memory and ensures proper cleanup
+unsafe impl Send for AlignedBuffer {}
+unsafe impl Sync for AlignedBuffer {}
 
 /// AlignedReader that uses GlobalFileManager for file operations
 pub struct AlignedReader {
@@ -25,8 +120,6 @@ pub struct AlignedReader {
     buffer_offset: usize,
     /// Number of valid bytes in the buffer
     buffer_valid_len: usize,
-    /// I/O statistics tracker
-    io_tracker: Option<IoStatsTracker>,
     /// Logical position in the file (unaligned)
     logical_pos: u64,
     /// File size
@@ -35,21 +128,10 @@ pub struct AlignedReader {
 
 impl AlignedReader {
     pub fn from_raw_fd(fd: RawFd) -> io::Result<Self> {
-        Self::from_raw_fd_with_tracker(fd, None)
+        Self::from_raw_fd_with_start_position(fd, 0)
     }
 
-    pub fn from_raw_fd_with_tracker(
-        fd: RawFd,
-        tracker: Option<IoStatsTracker>,
-    ) -> io::Result<Self> {
-        Self::from_raw_fd_with_start_position(fd, 0, tracker)
-    }
-
-    pub fn from_raw_fd_with_start_position(
-        fd: RawFd,
-        start_byte: u64,
-        tracker: Option<IoStatsTracker>,
-    ) -> io::Result<Self> {
+    pub fn from_raw_fd_with_start_position(fd: RawFd, start_byte: u64) -> io::Result<Self> {
         // Calculate aligned position and skip bytes
         let file_size = file_size_fd(fd).map_err(io::Error::other)?;
         let aligned_pos = align_down(start_byte, DIRECT_IO_ALIGNMENT as u64);
@@ -61,7 +143,6 @@ impl AlignedReader {
             file_offset: aligned_pos,
             buffer_offset: 0,
             buffer_valid_len: 0,
-            io_tracker: tracker,
             logical_pos: start_byte,
             file_size,
         };
@@ -81,11 +162,6 @@ impl AlignedReader {
     fn refill_buffer(&mut self) -> io::Result<usize> {
         // Read aligned data from file using the raw file descriptor
         let bytes_read = pread_fd(self.fd, self.buffer.as_mut_slice(), self.file_offset)?;
-
-        // Update I/O statistics if tracker is present
-        if let Some(ref tracker) = self.io_tracker {
-            tracker.add_read(1, bytes_read as u64);
-        }
 
         if bytes_read == 0 {
             // EOF reached - for now just return 0
@@ -320,22 +396,13 @@ pub struct AlignedChunkReader {
     /// Raw file descriptor for direct operations
     fd: RawFd,
     file_size: u64,
-    io_tracker: Option<IoStatsTracker>,
 }
 
 impl AlignedChunkReader {
     pub fn new(fd: RawFd) -> Result<Self, String> {
-        Self::new_with_tracker(fd, None)
-    }
-
-    pub fn new_with_tracker(fd: RawFd, tracker: Option<IoStatsTracker>) -> Result<Self, String> {
         let file_size = file_size_fd(fd).map_err(|e| format!("Failed to get file size: {}", e))?;
 
-        Ok(Self {
-            fd,
-            file_size,
-            io_tracker: tracker,
-        })
+        Ok(Self { fd, file_size })
     }
 }
 
@@ -350,9 +417,8 @@ impl ChunkReader for AlignedChunkReader {
 
     fn get_read(&self, start: u64) -> ParquetResult<Self::T> {
         // Create a new reader starting at the specified position
-        let reader =
-            AlignedReader::from_raw_fd_with_start_position(self.fd, start, self.io_tracker.clone())
-                .map_err(|e| parquet::errors::ParquetError::General(e.to_string()))?;
+        let reader = AlignedReader::from_raw_fd_with_start_position(self.fd, start)
+            .map_err(|e| parquet::errors::ParquetError::General(e.to_string()))?;
 
         Ok(reader)
     }
@@ -369,14 +435,54 @@ impl ChunkReader for AlignedChunkReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::constants::open_file_with_direct_io;
-
     use super::*;
+    use crate::file_manager::open_file_with_direct_io;
     use std::fs::File;
     use std::io::Write;
     use std::os::fd::{AsRawFd, IntoRawFd};
     use std::path::Path;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_aligned_buffer_creation() {
+        let buffer = AlignedBuffer::new(4096, 512).unwrap();
+        assert_eq!(buffer.capacity(), 4096);
+        assert_eq!(buffer.alignment(), 512);
+        assert!(buffer.is_aligned());
+    }
+
+    #[test]
+    fn test_aligned_buffer_read_write() {
+        let mut buffer = AlignedBuffer::new(1024, 512).unwrap();
+
+        // Write data
+        let data = b"Hello, aligned buffer!";
+        buffer.as_mut_slice()[..data.len()].copy_from_slice(data);
+
+        // Read data
+        assert_eq!(&buffer.as_slice()[..data.len()], data);
+    }
+
+    #[test]
+    fn test_alignment_validation() {
+        // Non-power-of-2 alignment should fail
+        assert!(AlignedBuffer::new(1024, 513).is_err());
+
+        // Power-of-2 alignments should succeed
+        assert!(AlignedBuffer::new(1024, 512).is_ok());
+        assert!(AlignedBuffer::new(1024, 1024).is_ok());
+        assert!(AlignedBuffer::new(1024, 4096).is_ok());
+    }
+
+    #[test]
+    fn test_buffer_alignment() {
+        let alignments = vec![512, 1024, 4096];
+
+        for align in alignments {
+            let buffer = AlignedBuffer::new(8192, align).unwrap();
+            assert_eq!(buffer.as_ptr() as usize % align, 0);
+        }
+    }
 
     fn create_test_file(dir: &Path, name: &str, size: usize) -> io::Result<(RawFd, Vec<u8>)> {
         let path = dir.join(name);
@@ -734,45 +840,6 @@ mod tests {
     }
 
     #[test]
-    fn test_io_tracker() {
-        let temp_dir = TempDir::new().unwrap();
-        let test_size = 100 * 1024; // 100KB to ensure multiple reads
-        let (file, _) = create_test_file(temp_dir.path(), "test.dat", test_size).unwrap();
-        let tracker = IoStatsTracker::new();
-        let mut reader =
-            AlignedReader::from_raw_fd_with_tracker(file.as_raw_fd(), Some(tracker.clone()))
-                .unwrap();
-
-        // Read some data
-        let mut buf = vec![0u8; 1000];
-        reader.read_exact(&mut buf).unwrap();
-
-        // Check that I/O was tracked
-        let (ops, bytes) = tracker.get_read_stats();
-        assert_eq!(ops, 1); // Should be exactly one read operation
-        assert!(bytes >= 1000); // Should have read at least the requested bytes
-
-        // Seek far enough to force a new read
-        reader.seek(80_000).unwrap();
-        reader.read_exact(&mut buf).unwrap();
-
-        // Check updated stats
-        let (ops2, bytes2) = tracker.get_read_stats();
-        assert_eq!(ops2, 2); // Should now be two read operations
-        assert!(bytes2 > bytes);
-
-        // Read a large amount to force multiple buffer refills
-        let mut large_buf = vec![0u8; 200_000];
-        reader.seek(0).unwrap();
-        let n = reader.read(&mut large_buf).unwrap();
-
-        // Check that we had multiple reads
-        let (ops3, _) = tracker.get_read_stats();
-        assert!(ops3 > 2); // Should have more read operations
-        assert_eq!(n, test_size); // Should have read the entire file
-    }
-
-    #[test]
     fn test_chunk_reader_interface() {
         let temp_dir = TempDir::new().unwrap();
 
@@ -792,28 +859,6 @@ mod tests {
         let mut buf = vec![0u8; 100];
         reader.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, &test_data[500..600]);
-    }
-
-    #[test]
-    fn test_chunk_reader_with_tracker() {
-        let temp_dir = TempDir::new().unwrap();
-
-        // Create larger test data
-        let test_data: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
-        let file = create_test_file_with_data(temp_dir.path(), "test.dat", &test_data).unwrap();
-        let tracker = IoStatsTracker::new();
-
-        let chunk_reader =
-            AlignedChunkReader::new_with_tracker(file.as_raw_fd(), Some(tracker.clone())).unwrap();
-
-        // Read some chunks
-        let _ = chunk_reader.get_bytes(0, 1000).unwrap();
-        let _ = chunk_reader.get_bytes(50_000, 2000).unwrap();
-
-        // Check that I/O was tracked
-        let (ops, bytes) = tracker.get_read_stats();
-        assert!(ops > 0);
-        assert!(bytes > 0);
     }
 
     #[test]
@@ -1141,12 +1186,9 @@ mod tests {
         let test_positions = vec![0, 1, 511, 512, 512, 63999, 64000, 64001, 99999, 100000];
 
         for start_pos in test_positions {
-            let mut reader = AlignedReader::from_raw_fd_with_start_position(
-                file.as_raw_fd(),
-                start_pos,
-                None, // No IoStatsTracker for this test
-            )
-            .unwrap();
+            let mut reader =
+                AlignedReader::from_raw_fd_with_start_position(file.as_raw_fd(), start_pos)
+                    .unwrap();
 
             // Read and verify data
             let mut buf = vec![0u8; 100];
