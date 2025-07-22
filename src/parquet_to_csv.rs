@@ -3,6 +3,7 @@
 use crate::{
     aligned_reader::AlignedChunkReader,
     constants::open_file_with_direct_io,
+    parallel_csv_writer::ParallelCsvWriterBuilder,
     IoStatsTracker,
 };
 use arrow::array::{Array, ArrayRef};
@@ -12,6 +13,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::os::fd::{IntoRawFd, RawFd};
 use std::path::Path;
 use std::sync::Arc;
+use std::thread;
 
 /// Convert a value from an Arrow array to a CSV-compatible string
 fn value_to_csv_string(array: &ArrayRef, row: usize) -> String {
@@ -282,6 +284,140 @@ impl ParquetToCsvConverter {
         }
 
         scanners
+    }
+    
+    /// Convert Parquet to CSV using parallel writers for maximum throughput
+    pub fn convert_to_csv_parallel(
+        &self,
+        output_path: impl AsRef<Path>,
+        num_threads: usize,
+        buffer_size: usize,
+        io_tracker: Option<IoStatsTracker>,
+    ) -> Result<(), String> {
+        let output_path = output_path.as_ref();
+        
+        // Open output file with Direct I/O
+        let output_file = open_file_with_direct_io(output_path)
+            .map_err(|e| format!("Failed to open output file: {}", e))?;
+        let output_fd = output_file.into_raw_fd();
+        
+        // Write header first
+        let header = format!("{}\n", self.get_header());
+        use crate::file_manager::pwrite_fd;
+        pwrite_fd(output_fd, header.as_bytes(), 0)
+            .map_err(|e| format!("Failed to write header: {}", e))?;
+        
+        // Create parallel writer starting after header
+        let writer = ParallelCsvWriterBuilder::new()
+            .buffer_size(buffer_size)
+            .enable_io_stats(io_tracker.is_some())
+            .build(output_fd, header.len() as u64);
+        
+        // Create scanners for each thread
+        let scanners = self.create_parallel_csv_scanners(num_threads, io_tracker);
+        
+        if scanners.is_empty() {
+            return Ok(());
+        }
+        
+        // Spawn threads to process partitions in parallel
+        let handles: Vec<_> = scanners
+            .into_iter()
+            .enumerate()
+            .map(|(_thread_id, scanner)| {
+                let thread_writer = writer.get_thread_writer();
+                
+                thread::spawn(move || -> Result<(), String> {
+                    // Process scanner output with buffering
+                    thread_writer.write_lines_buffered(scanner, buffer_size)?;
+                    
+                    Ok(())
+                })
+            })
+            .collect();
+        
+        // Wait for all threads to complete
+        for (i, handle) in handles.into_iter().enumerate() {
+            match handle.join() {
+                Ok(result) => result?,
+                Err(e) => return Err(format!("Thread {} panicked: {:?}", i, e)),
+            }
+        }
+        
+        // Close the file descriptor
+        unsafe {
+            libc::close(output_fd);
+        }
+        
+        Ok(())
+    }
+    
+    /// Convert Parquet to CSV using memory-mapped file for maximum performance
+    /// This approach avoids Direct I/O alignment issues while maintaining high throughput
+    pub fn convert_to_csv_mmap(
+        &self,
+        output_path: impl AsRef<Path>,
+        num_threads: usize,
+        io_tracker: Option<IoStatsTracker>,
+    ) -> Result<(), String> {
+        use crate::mmap_csv_writer::{MmapCsvWriter, estimate_csv_size};
+        
+        let output_path = output_path.as_ref();
+        
+        // Estimate file size based on schema and row count
+        let avg_field_size = match self.schema.fields().len() {
+            0..=5 => 20,    // Small schemas: assume larger fields
+            6..=15 => 15,   // Medium schemas
+            _ => 10,        // Large schemas: assume smaller fields
+        };
+        
+        let estimated_size = estimate_csv_size(
+            self.num_rows,
+            self.schema.fields().len(),
+            avg_field_size,
+        );
+        
+        // Create memory-mapped writer
+        let writer = MmapCsvWriter::new(output_path, estimated_size, io_tracker.clone())?;
+        
+        // Write header
+        writer.write_header(&self.get_header())?;
+        
+        // Create scanners for each thread
+        let scanners = self.create_parallel_csv_scanners(num_threads, io_tracker);
+        
+        if scanners.is_empty() {
+            writer.finalize()?;
+            return Ok(());
+        }
+        
+        // Spawn threads to process partitions
+        let handles: Vec<_> = scanners
+            .into_iter()
+            .enumerate()
+            .map(|(_thread_id, scanner)| {
+                let thread_writer = writer.get_thread_writer();
+                
+                thread::spawn(move || -> Result<(), String> {
+                    // Process with batching for efficiency
+                    thread_writer.write_lines_buffered(scanner, 1024 * 1024)?; // 1MB batches
+                    Ok(())
+                })
+            })
+            .collect();
+        
+        // Wait for all threads
+        for (i, handle) in handles.into_iter().enumerate() {
+            match handle.join() {
+                Ok(result) => result?,
+                Err(e) => return Err(format!("Thread {} panicked: {:?}", i, e)),
+            }
+        }
+        
+        // Finalize the file (truncate to actual size)
+        writer.finalize()?;
+        
+        Ok(())
     }
 }
 

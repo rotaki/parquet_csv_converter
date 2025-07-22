@@ -10,7 +10,7 @@ use crate::constants::{
     align_down, align_up, offset_within_block, DEFAULT_BUFFER_SIZE, DIRECT_IO_ALIGNMENT,
 };
 use crate::file_size_fd;
-use crate::global_file_manager::pread_fd;
+use crate::file_manager::pread_fd;
 use crate::io_stats::IoStatsTracker;
 
 /// AlignedReader that uses GlobalFileManager for file operations
